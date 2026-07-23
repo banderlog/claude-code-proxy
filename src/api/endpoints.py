@@ -172,6 +172,12 @@ async def health_check():
     }
 
 
+@router.head("/health")
+async def health_check_head():
+    """HEAD request support for health endpoint"""
+    return {}
+
+
 @router.get("/test-connection")
 async def test_connection():
     """Test API connectivity to OpenAI"""
@@ -232,3 +238,25 @@ async def root():
             "test_connection": "/test-connection",
         },
     }
+
+
+@router.head("/")
+async def root_head():
+    """HEAD request support for root endpoint - used by health checks and monitoring tools"""
+    return {}
+
+
+@router.get("/api/hello")
+async def api_hello():
+    """Simple hello endpoint for testing under /api prefix"""
+    return {
+        "message": "Hello from Claude Code Proxy",
+        "status": "ok",
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+@router.head("/api/hello")
+async def api_hello_head():
+    """HEAD request support for /api/hello endpoint"""
+    return {}
