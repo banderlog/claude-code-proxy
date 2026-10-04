@@ -3,6 +3,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from datetime import datetime
 import uuid
 from typing import Optional
+import json
+import traceback
 
 from src.core.config import config
 from src.core.logging import logger
@@ -50,6 +52,58 @@ async def validate_api_key(x_api_key: Optional[str] = Header(None), authorizatio
             detail="Invalid API key. Please provide a valid Anthropic API key."
         )
 
+
+async def stream_message_response(
+    openai_stream,
+    original_request: ClaudeMessagesRequest,
+    http_request: Request,
+    request_id: str,
+):
+    """
+    Stream Claude response with proper error handling inside the generator.
+    This ensures errors are sent as SSE events, not as HTTP response replacements.
+    """
+    try:
+        async for line in convert_openai_streaming_to_claude_with_cancellation(
+            openai_stream,
+            original_request,
+            logger,
+            http_request,
+            openai_client,
+            request_id,
+        ):
+            # Check if client disconnected before yielding
+            if await http_request.is_disconnected():
+                logger.info(f"Client disconnected, stopping stream for request {request_id}")
+                openai_client.cancel_request(request_id)
+                return
+
+            yield line
+
+    except HTTPException as e:
+        # Handle HTTP exceptions - convert to SSE error event
+        logger.error(f"HTTP error during streaming: {e.status_code} - {e.detail}")
+        error_message = openai_client.classify_openai_error(e.detail)
+        error_event = {
+            "type": "error",
+            "error": {"type": "api_error", "message": error_message},
+        }
+        yield f"event: error\ndata: {json.dumps(error_event, ensure_ascii=False)}\n\n"
+        return
+
+    except Exception as e:
+        # Handle unexpected exceptions - convert to SSE error event
+        logger.error(f"Unexpected error during streaming: {e}")
+        logger.error(traceback.format_exc())
+        error_message = openai_client.classify_openai_error(str(e))
+        error_event = {
+            "type": "error",
+            "error": {"type": "api_error", "message": error_message},
+        }
+        yield f"event: error\ndata: {json.dumps(error_event, ensure_ascii=False)}\n\n"
+        return
+
+
 @router.post("/v1/messages")
 async def create_message(request: ClaudeMessagesRequest, http_request: Request, _: None = Depends(validate_api_key)):
     try:
@@ -68,40 +122,26 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
             raise HTTPException(status_code=499, detail="Client disconnected")
 
         if request.stream:
-            # Streaming response - wrap in error handling
-            try:
-                openai_stream = openai_client.create_chat_completion_stream(
-                    openai_request, request_id
-                )
-                return StreamingResponse(
-                    convert_openai_streaming_to_claude_with_cancellation(
-                        openai_stream,
-                        request,
-                        logger,
-                        http_request,
-                        openai_client,
-                        request_id,
-                    ),
-                    media_type="text/event-stream",
-                    headers={
-                        "Cache-Control": "no-cache",
-                        "Connection": "keep-alive",
-                        "Access-Control-Allow-Origin": "*",
-                        "Access-Control-Allow-Headers": "*",
-                    },
-                )
-            except HTTPException as e:
-                # Convert to proper error response for streaming
-                logger.error(f"Streaming error: {e.detail}")
-                import traceback
-
-                logger.error(traceback.format_exc())
-                error_message = openai_client.classify_openai_error(e.detail)
-                error_response = {
-                    "type": "error",
-                    "error": {"type": "api_error", "message": error_message},
-                }
-                return JSONResponse(status_code=e.status_code, content=error_response)
+            # Streaming response - return immediately with streaming generator
+            # Error handling is done inside the generator, not here
+            openai_stream = openai_client.create_chat_completion_stream(
+                openai_request, request_id
+            )
+            return StreamingResponse(
+                stream_message_response(
+                    openai_stream,
+                    request,
+                    http_request,
+                    request_id,
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Headers": "*",
+                },
+            )
         else:
             # Non-streaming response
             openai_response = await openai_client.create_chat_completion(
@@ -111,11 +151,10 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
                 openai_response, request
             )
             return claude_response
+
     except HTTPException:
         raise
     except Exception as e:
-        import traceback
-
         logger.error(f"Unexpected error processing request: {e}")
         logger.error(traceback.format_exc())
         error_message = openai_client.classify_openai_error(str(e))
